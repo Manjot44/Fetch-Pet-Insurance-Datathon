@@ -46,17 +46,15 @@ Each cluster has:
 **Severity Credibility Adjustment**:
 If cluster data is sparse (e.g., Cluster 2):
 ```math
-\[
 \hat{S}_{\text{final}} = z \cdot \hat{S}_{\text{cluster}} + (1 - z) \cdot \hat{S}_{\text{global}}
-\]
 ```
 Where *z* is the credibility weight.
 
 ### 🧮 Pure Premium Calculation
 Final premium is:
-\[
+```math
 \text{Pure Premium} = \sum_{c=1}^3 f_c \cdot s_c
-\]
+```
 Where *f* = frequency and *s* = credibility-adjusted severity per cluster.
 
 ---
