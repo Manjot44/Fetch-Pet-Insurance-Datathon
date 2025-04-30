@@ -1,0 +1,993 @@
+
+### Load packages
+library(ggplot2)
+library(dplyr)
+library(glmnet)
+library(randomForest)
+library(plotly)
+library(caret)
+library(tidyr)
+library(stringdist)
+library(cluster)
+library(factoextra)
+
+
+### Set Plot Themes
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5, size = 10, face = 'bold'))
+theme_update(text = element_text(size = 10))
+
+#---- Data Preparation----
+
+earned <- read.csv('UNSW_earned_data_adjusted_Sep27.csv')
+
+# Remove time part from UW_Date and nb_policy_first_inception_date
+earned$UW_Date <- gsub(" .*", "", earned$UW_Date)
+earned$nb_policy_first_inception_date <- gsub(" .*", "", earned$nb_policy_first_inception_date)
+
+# Convert to Date class assuming the format is day/month/year (DD/MM/YYYY)
+earned$UW_Date <- as.Date(earned$UW_Date, format = "%d/%m/%Y")
+earned$nb_policy_first_inception_date <- as.Date(earned$nb_policy_first_inception_date, format = "%d/%m/%Y")
+earned$person_dob <- as.Date(earned$person_dob, format = "%d/%m/%Y")
+
+# Use gsub to remove everything in parentheses, including the parentheses themselves
+earned$quote_time_group <- gsub("\\s*\\(.*?\\)", "", earned$quote_time_group)
+
+# Remove the exposure_id_1 column using the subset function
+earned <- subset(earned, select = -exposure_id_1)
+
+# Replace age ranges with categories
+earned$pet_de_sexed_age <- gsub("0-3 (mo|months)", "de_sex_0-3mo", earned$pet_de_sexed_age)
+earned$pet_de_sexed_age <- gsub("4-6 mo", "de_sex_4-6mo", earned$pet_de_sexed_age)   # 4-6 months -> Young
+earned$pet_de_sexed_age <- gsub("7-12 (mo|months)", "de_sex_7-12mo", earned$pet_de_sexed_age) # 7-12 months -> Juvenile
+earned$pet_de_sexed_age <- gsub("1-2 yr", "de_sex_1-2yr", earned$pet_de_sexed_age)    # 1-2 years -> Adult
+# Replace "2+ yr" with "Mature", escaping the "+" character
+earned$pet_de_sexed_age <- gsub("2\\+ yr", "de_sex_2+yr", earned$pet_de_sexed_age)    # 2+ years -> Mature
+earned$pet_de_sexed_age <- gsub("2\\+ years", "de_sex_2+yr", earned$pet_de_sexed_age) # In case of "2+ years" as well
+
+# Replace blank entries with "Never de-sexed" and keep "Not Sure"
+earned$pet_de_sexed_age <- ifelse(earned$pet_de_sexed_age == "", "Never de-sexed", earned$pet_de_sexed_age)
+earned$pet_de_sexed_age <- ifelse(earned$pet_de_sexed_age == "Not Sure", "Not Sure", earned$pet_de_sexed_age)
+
+# Convert the column to a factor (categorical variable)
+earned$pet_de_sexed_age <- factor(earned$pet_de_sexed_age, 
+                                  levels = c("de_sex_0-3mo", "de_sex_4-6mo", "de_sex_7-12mo", "de_sex_1-2yr", "de_sex_2+yr", "Not Sure", "Never de-sexed"))
+
+# Encoding pet_gender, pet_de_sexed, nb_address_type_adj, is_multi_pet_plan, quote_time_group
+earned$pet_gender <- factor(earned$pet_gender, levels = c("male", "female"))
+earned$pet_de_sexed <- factor(earned$pet_de_sexed, levels = c("TRUE", "FALSE"))
+earned$nb_address_type_adj <- factor(earned$nb_address_type_adj)
+earned$is_multi_pet_plan <- factor(earned$is_multi_pet_plan, levels = c("TRUE", "FALSE"))
+earned$quote_time_group <- factor(earned$quote_time_group)
+
+# Removing the 'X' column
+earned <- earned[ , !(names(earned) %in% c("X"))]
+earned <- earned[ , !(names(earned) %in% c("row_num"))]
+
+# Summarise the data, accounting for all columns
+earned <- earned %>%
+  group_by(exposure_id) %>%
+  summarise(
+    # Date Columns
+    UW_Date = max(UW_Date),  # Most recent underwriting date
+    nb_policy_first_inception_date = min(nb_policy_first_inception_date, na.rm = TRUE),  # Earliest inception date
+    
+    # Numeric Columns
+    tenure = max(tenure, na.rm = TRUE),  # Maximum tenure
+    pet_age_months = mean(pet_age_months, na.rm = TRUE),  # Average pet age in months
+    pet_age_years = mean(pet_age_years, na.rm = TRUE),  # Average pet age in years
+    nb_contribution = mean(nb_contribution, na.rm = TRUE), # Average contribution
+    nb_contribution_excess = mean(nb_contribution_excess, na.rm = TRUE),  # Average contribution excess
+    nb_excess = mean(nb_excess, na.rm = TRUE),  # Average excess
+    nb_number_of_breeds = max(nb_number_of_breeds, na.rm = TRUE),  # Maximum number of breeds
+    nb_average_breed_size = mean(nb_average_breed_size, na.rm = TRUE),  # Average breed size
+    earned_units = sum(earned_units, na.rm = TRUE),  # Sum of earned units
+    
+    # Boolean Columns
+    is_multi_pet_plan = any(is_multi_pet_plan == "TRUE"),  # TRUE if any multi-pet plan exists
+    pet_de_sexed = first(pet_de_sexed),  # First occurrence of pet de-sexed
+    
+    # Categorical Columns
+    pet_gender = first(pet_gender),  # First occurrence of pet gender
+    pet_de_sexed_age = first(pet_de_sexed_age),  # First occurrence of pet de-sexed age
+    nb_address_type_adj = first(nb_address_type_adj),  # First occurrence of address type
+    nb_postcode = first(nb_postcode),  # First postcode
+    nb_state = first(nb_state),  # First state
+    nb_suburb = first(nb_suburb),  # First suburb
+    nb_breed_type = first(nb_breed_type),  # First breed type
+    nb_breed_trait = first(nb_breed_trait),  # First breed trait
+    nb_breed_name_unique = first(nb_breed_name_unique),  # First breed name
+    nb_breed_name_unique_concat = first(nb_breed_name_unique_concat),  # First concatenated breed name
+    quote_time_group = first(quote_time_group),  # First quote time group
+    
+    # Person-related columns (if applicable)
+    person_dob = first(person_dob),  # First person date of birth
+    owner_age_years = max(owner_age_years, na.rm = TRUE),  # Average owner age
+    
+    # Additional Columns
+    pet_is_switcher = first(pet_is_switcher),  # First occurrence of switcher
+    lead_date_day = first(lead_date_day),  # First occurrence of lead date day
+    quote_date = first(quote_date),  # First quote date
+  )
+
+# Identify columns with NAs and count the number of NAs in each
+na_counts <- sapply(earned, function(x) sum(is.na(x)))
+na_counts <- na_counts[na_counts > 0]  # Filter to show only columns with NAs
+
+earned$person_dob
+
+# Print the results
+print(na_counts)
+
+
+earned <- earned[earned$tenure >= 0, ]
+
+# Remove rows with NA in person_dob
+earned <- earned[!is.na(earned$person_dob), ]
+
+claims <- read.csv('UNSW_claims_data.csv')
+
+# Convert 'claim_start_date' to Date type
+claims$claim_start_date <- as.Date(claims$claim_start_date, format="%d/%m/%Y")
+
+# Ensure 'claim_paid' and 'total_claim_amount' are numeric
+claims$claim_paid <- as.numeric(claims$claim_paid)
+claims$total_claim_amount <- as.numeric(claims$total_claim_amount)
+
+# Remove the 'tenure' column from the 'claims' dataset
+claims <- claims[, !names(claims) %in% 'tenure']
+
+#----Creating severity dataset----
+
+# Remove rows where claim_paid == 0
+claims <- claims %>%
+  filter(claim_paid != 0)
+
+#----Calculating Frequency of claims per exposure----
+
+# Count the number of claims for each exposure_id and store it in 'claim_counts'
+claim_counts <- claims %>%
+  group_by(exposure_id) %>%
+  summarise(claim_count = n()) %>%
+  ungroup()
+
+# Step 2: Merge the claim frequencies into the 'earned' dataset without modifying 'claims'
+frequency_data <- earned %>%
+  left_join(claim_counts, by = "exposure_id") %>%
+  mutate(claim_count = ifelse(is.na(claim_count), 0, claim_count))
+
+
+### Creating the test dataset for the overall RMSE calculation (test_data_prem)
+# Step 1: Expand the 'claims' dataset so each row corresponds to a separate claim, with claim_count = 1
+# For each exposure_id, create a row for each individual claim
+expanded_claims <- claims %>%
+  mutate(claim_count = 1, 
+         claim_paid = ifelse(is.na(claim_paid), 0, claim_paid))  # Set claim_paid to 0 if it is NA
+
+frequency_data2 <- earned %>%
+  left_join(expanded_claims, by = "exposure_id") %>%
+  mutate(claim_count = ifelse(is.na(claim_count), 0, claim_count),
+         claim_paid = ifelse(is.na(claim_paid), 0, claim_paid))  # Set claim_paid to 0 for non-claim rows
+
+#----Adding in sets of potential predictors
+
+### Adding in SA2, SA3 and SA4 location
+
+SA3 <- read.csv('POSTCODE_SA3_MAPPING.csv')
+
+# Ensure unique mapping for each postcode in SA3, picking the first match
+SA3_unique <- SA3 %>%
+  group_by(POSTCODE) %>%
+  summarise(SA3_CODE_2011 = first(SA3_CODE_2011))  # Pick the first match for SA3
+
+# Perform the left join to add SA3_CODE_2011
+frequency_data <- frequency_data %>%
+  left_join(SA3_unique, by = c("nb_postcode" = "POSTCODE"))
+
+#----Incorporating ABS related data----
+income_sa3 <- read.csv('income_sa3.csv')
+
+library(dplyr)
+frequency_data <- frequency_data %>%
+  left_join(income_sa3 %>% select(Code, Median_employee_income_SA3, Mean_employee_income_SA3), 
+            by = c("SA3_CODE_2011" = "Code"))
+
+added_var_abs <- read.csv('add_abs_variables.csv')
+colnames(added_var_abs)
+
+# Left join frequency_data with added_var_abs using SA3_CODE_2011 and selecting specific columns from added_var_abs
+frequency_data <- frequency_data %>%
+  left_join(
+    added_var_abs %>% 
+      select(Code, 
+             Total_number_bus, 
+             Number_non.employing_bus,  # Updated to the correct column name
+             Total_employed_aged_15_and_over, 
+             Median_price_established_house_transfers, 
+             Value_private_sector_houses, 
+             Agriculture_forestry_fishing_per, 
+             Health_care_social_assistance_per, 
+             Professional_scientific_technical_services_per, 
+             Number_employee_jobs_agriculture_forestry_fishing, 
+             Number_employee._jobs_health_care,  # Updated to the correct column name
+             Total_persons_aged_15_years_over, 
+             Persons_who_made_HELP_repayment, 
+             Number_employee_jobs_professional_scientific_technical, 
+             Graduate_diploma_perc, 
+             Bachelor_degree_perc, 
+             Completed_year_12_perc, 
+             Worked_from_home, 
+             Average_household_size, 
+             Lone_person_households, 
+             Median_weekly_household_rent, 
+             Persons_who_made_gift_or_donation, 
+             Total_protected_land_area, 
+             National_parks, 
+             Nature_reserves, 
+             X_1.499_per_week, 
+             Participation_rate, 
+             Professionals_perc, 
+             Bachelor_degree_perc.1, 
+             X_3000_or_more_per_week, 
+             Managers, 
+             Unemployment_rate, 
+             X_2000_2999_per_week, 
+             Not_in_labour_force), 
+    by = c("SA3_CODE_2011" = "Code")
+  )
+
+# Convert appropriate columns to factor or numeric
+frequency_data <- frequency_data %>%
+  mutate(
+    # Convert logical columns to factor
+    is_multi_pet_plan = as.factor(is_multi_pet_plan),
+    pet_de_sexed = as.factor(pet_de_sexed),
+    pet_gender = as.factor(pet_gender),
+    pet_de_sexed_age = as.factor(pet_de_sexed_age),
+    nb_address_type_adj = as.factor(nb_address_type_adj),
+    nb_breed_type = as.factor(nb_breed_type),
+    
+    # Convert character columns to factor if needed
+    nb_state = as.factor(nb_state),
+    nb_suburb = as.factor(nb_suburb),
+    
+    # Ensure numeric variables are correctly encoded
+    Median_employee_income_SA3 = as.numeric(as.character(Median_employee_income_SA3)),
+    Mean_employee_income_SA3 = as.numeric(as.character(Mean_employee_income_SA3)),
+    Total_number_bus = as.numeric(as.character(Total_number_bus)),
+    Number_non.employing_bus = as.numeric(as.character(Number_non.employing_bus)),
+    Total_employed_aged_15_and_over = as.numeric(as.character(Total_employed_aged_15_and_over)),
+    Agriculture_forestry_fishing_per = as.numeric(as.character(Agriculture_forestry_fishing_per)),
+    Health_care_social_assistance_per = as.numeric(as.character(Health_care_social_assistance_per)),
+    Professional_scientific_technical_services_per = as.numeric(as.character(Professional_scientific_technical_services_per)),
+    Number_employee_jobs_agriculture_forestry_fishing = as.numeric(as.character(Number_employee_jobs_agriculture_forestry_fishing)),
+    Number_employee._jobs_health_care = as.numeric(as.character(Number_employee._jobs_health_care)),
+    Worked_from_home = as.numeric(as.character(Worked_from_home)),
+    Lone_person_households = as.numeric(as.character(Lone_person_households)),
+    X_1.499_per_week = as.numeric(as.character(X_1.499_per_week)),
+    Participation_rate = as.numeric(as.character(Participation_rate)),
+    Professionals_perc = as.numeric(as.character(Professionals_perc)),
+    Bachelor_degree_perc.1 = as.numeric(as.character(Bachelor_degree_perc.1)),
+    X_3000_or_more_per_week = as.numeric(as.character(X_3000_or_more_per_week)),
+    Managers = as.numeric(as.character(Managers)),
+    Unemployment_rate = as.numeric(as.character(Unemployment_rate)),
+    X_2000_2999_per_week = as.numeric(as.character(X_2000_2999_per_week)),
+    Not_in_labour_force = as.numeric(as.character(Not_in_labour_force)),
+    Completed_year_12_perc = as.numeric(as.character(Completed_year_12_perc)),
+    Bachelor_degree_perc = as.numeric(as.character(Bachelor_degree_perc)),
+    Graduate_diploma_perc = as.numeric(as.character(Graduate_diploma_perc)),
+    Number_employee_jobs_professional_scientific_technical = as.numeric(as.character(Number_employee_jobs_professional_scientific_technical)),
+    Persons_who_made_HELP_repayment = as.numeric(as.character(Persons_who_made_HELP_repayment)),
+    National_parks = as.numeric(as.character(National_parks)),
+    Nature_reserves = as.numeric(as.character(Nature_reserves)),
+    Total_protected_land_area = as.numeric(as.character(Total_protected_land_area)),
+    Persons_who_made_gift_or_donation = as.numeric(as.character(Persons_who_made_gift_or_donation)),
+  )
+
+#---- incorporating breed behavioral characteristic related data----
+
+new_dog_data <- read.csv('dogs_cleaned.csv')
+
+# Ensure the format of new_dog_data$Breed.Name matches frequency_data$nb_breed_name_unique
+new_dog_data$Breed.Name <- tolower(new_dog_data$Breed.Name)  # Convert to lowercase
+new_dog_data$Breed.Name <- trimws(new_dog_data$Breed.Name)   # Remove leading/trailing whitespace
+
+frequency_data$nb_breed_name_unique <- tolower(frequency_data$nb_breed_name_unique)  # Convert to lowercase
+frequency_data$nb_breed_name_unique <- trimws(frequency_data$nb_breed_name_unique)   # Remove leading/trailing whitespace
+
+# Get unique breed names from both datasets
+unique_frequency_breeds <- unique(frequency_data$nb_breed_name_unique)
+unique_new_dog_breeds <- unique(new_dog_data$Breed.Name)
+
+# Find breeds in frequency_data that are not in new_dog_data
+missing_breeds <- setdiff(unique_frequency_breeds, unique_new_dog_breeds)
+
+# Calculate the string distance matrix between missing breeds and new dog breeds
+distance_matrix <- stringdistmatrix(missing_breeds, unique_new_dog_breeds, method = "jw")  # Jaro-Winkler method
+
+# Find the index of the closest match for each missing breed
+closest_match_indices <- apply(distance_matrix, 1, which.min)
+
+# Get the closest matches from new_dog_data
+closest_matches <- unique_new_dog_breeds[closest_match_indices]
+
+# Create a data frame with missing breeds and their closest match
+matching_df <- data.frame(
+  Missing_Breeds = missing_breeds,
+  Suggested_Matches = closest_matches,
+  stringsAsFactors = FALSE
+)
+
+# Create a named vector for easier replacement
+replacement_vector <- setNames(matching_df$Suggested_Matches, matching_df$Missing_Breeds)
+
+# Replace values in 'nb_breed_name_unique' with the corresponding 'Suggested_Matches' values
+frequency_data$nb_breed_name_unique <- ifelse(
+  frequency_data$nb_breed_name_unique %in% matching_df$Missing_Breeds, 
+  replacement_vector[frequency_data$nb_breed_name_unique], 
+  frequency_data$nb_breed_name_unique
+)
+
+# Merge frequency_data with new_dog_data on breed names
+frequency_data <- merge(frequency_data, new_dog_data, by.x = "nb_breed_name_unique", by.y = "Breed.Name", all.x = TRUE)
+
+# Convert specified columns to factors
+frequency_data$Dog.Breed.Group <- as.factor(frequency_data$Dog.Breed.Group)
+frequency_data$Dog.Size <- as.factor(frequency_data$Dog.Size)
+frequency_data$Height <- as.factor(frequency_data$Height)
+frequency_data$Weight <- as.factor(frequency_data$Weight)
+frequency_data$Life.Span <- as.factor(frequency_data$Life.Span)
+
+# Assuming both 'claims' and 'frequency_data' datasets have a common 'exposure_id' column
+severity_data <- claims %>%
+  left_join(frequency_data, by = "exposure_id")
+
+# Removing 'National_parks' and 'Nature_reserves' from frequency_data and severity_data
+frequency_data <- frequency_data %>%
+  select(-National_parks, -Nature_reserves)
+
+severity_data <- severity_data %>%
+  select(-National_parks, -Nature_reserves)
+
+# Remove the specified columns from frequency_data and severity_data
+columns_to_remove <- c('Total_protected_land_area', 'Persons_who_made_gift_or_donation', 
+                       'Median_price_established_house_transfers', 'Value_private_sector_houses')
+
+# Removing from frequency_data
+frequency_data <- frequency_data %>%
+  select(-all_of(columns_to_remove))
+
+# Removing from severity_data
+severity_data <- severity_data %>%
+  select(-all_of(columns_to_remove))
+
+# Remove rows where earned_units is 0 in frequency_data
+frequency_data <- frequency_data[frequency_data$earned_units > 0, ]
+
+
+
+# Define a function to add the exp_future_life column to a dataset
+add_exp_future_life <- function(data) {
+  if("Avg..Life.Span..years" %in% colnames(data) & "pet_age_months" %in% colnames(data)) {
+    data$exp_future_life <- data$Avg..Life.Span..years - (data$pet_age_months / 12)
+  } else {
+    print("One or both columns 'Avg..Life.Span..years' and 'pet_age_months' are missing in the dataset.")
+  }
+  return(data)
+}
+
+# Apply the function to each dataset
+frequency_data <- add_exp_future_life(frequency_data)
+severity_data <- add_exp_future_life(severity_data)
+
+# Define a function to add the new feature based on nb_address_type_adj
+add_apartment_feature <- function(data) {
+  data$happy_in_apartment <- ifelse(data$nb_address_type_adj == "Apartment", 
+                             data$Adapts.Well.To.Apartment.Living, 
+                             0)
+  return(data)
+}
+
+# Apply the function to both frequency_data and frequency_data2
+frequency_data <- add_apartment_feature(frequency_data)
+severity_data <- add_apartment_feature(severity_data)
+
+# Define a function to create the dog_safety interaction feature
+add_dog_safety_feature <- function(data) {
+  data$dog_safety <- ifelse(data$is_multi_pet_plan == TRUE, data$Dog.Friendly, 0)
+  return(data)
+}
+
+# Apply the function to both frequency_data and severity_data
+frequency_data <- add_dog_safety_feature(frequency_data)
+severity_data <- add_dog_safety_feature(severity_data)
+
+# Apply the function to both frequency_data and severity_data
+frequency_data <- add_dog_safety_feature(frequency_data)
+severity_data <- add_dog_safety_feature(severity_data)
+
+# Define a function to add the expected_aggression feature
+add_expected_aggression <- function(data) {
+  data$expected_aggression <- ifelse(data$pet_de_sexed == TRUE, 
+                                     0, 
+                                     5 - data$All.Around.Friendliness)
+  return(data)
+}
+
+# Apply the function to both frequency_data and severity_data
+frequency_data <- add_expected_aggression(frequency_data)
+severity_data <- add_expected_aggression(severity_data)
+
+
+#----Clustering----
+
+# Step 1: Count the number of claims for each exposure_id and condition_category
+claim_counts2 <- claims %>%
+  group_by(exposure_id, condition_category) %>%
+  summarise(claim_count = n()) %>%
+  ungroup()
+
+# Merge with earned data to get earned_units
+frequency_data_clus <- claim_counts2 %>%
+  left_join(earned, by = "exposure_id") %>%
+  select(exposure_id, condition_category, claim_count, earned_units)
+
+# Calculate claims per earned_units for frequency
+frequency_data_clus <- frequency_data_clus %>%
+  mutate(frequency = claim_count / earned_units)
+
+# Calculate mean and standard deviation of frequency for each condition_category
+frequency_summary <- frequency_data_clus %>%
+  group_by(condition_category) %>%
+  summarise(
+    mean_frequency = mean(frequency, na.rm = TRUE),
+    sd_frequency = sd(frequency, na.rm = TRUE)
+  )
+
+# Calculate mean and standard deviation of claim_paid for severity_data
+severity_summary <- severity_data %>%
+  group_by(condition_category) %>%
+  summarise(
+    mean_severity = mean(claim_paid, na.rm = TRUE),
+    sd_severity = sd(claim_paid, na.rm = TRUE)
+  )
+
+# Merging both summaries into a single data frame
+condition_summary <- merge(frequency_summary, severity_summary, by = "condition_category")
+
+# Step 1: Prepare the data with mean_frequency, mean_severity, and sd_severity
+condition_data_scaled_3d <- scale(condition_summary[, c("mean_frequency", "mean_severity", "sd_severity")])
+
+# Step 2: Perform K-means clustering with 3 centers (as determined earlier)
+set.seed(123)
+kmeans_3d <- kmeans(condition_data_scaled_3d, centers = 5, nstart = 25)
+
+# Step 3: Calculate silhouette score for this clustering
+silhouette_3d <- silhouette(kmeans_3d$cluster, dist(condition_data_scaled_3d))
+
+# Step 4: Visualize the silhouette plot for this clustering
+fviz_silhouette(silhouette_3d) + ggtitle("Silhouette Plot - Clustering with Mean Frequency, Mean Severity, and SD Severity")
+
+# Step 5: Calculate the average silhouette width
+avg_silhouette_3d <- mean(silhouette_3d[, 3])
+cat("Average Silhouette Width (3D Clustering - Mean Frequency, Mean Severity, and SD Severity):", avg_silhouette_3d, "\n")
+
+# Step 6: Add the cluster results to the original data
+condition_summary$cluster <- as.factor(kmeans_3d$cluster)
+
+# Step 7: Create the 3D scatter plot using the standardized values
+plot_ly(
+  data = condition_summary,
+  x = ~mean_frequency,  # This is now the standardized mean_frequency
+  y = ~mean_severity,   # Standardized mean_severity
+  z = ~sd_severity,     # Standardized sd_severity
+  color = ~cluster,     # Cluster will be represented by color
+  size = ~mean_severity,  # Size represents the mean_severity
+  text = ~condition_category,  # Condition category as hover text
+  type = 'scatter3d',   # 3D scatter plot
+  mode = 'markers',
+  marker = list(sizemode = 'diameter')  # Adjust size by diameter
+) %>%
+  layout(
+    title = "3D Scatter Plot of Condition Categories",
+    scene = list(
+      xaxis = list(title = 'Mean Frequency'),
+      yaxis = list(title = 'Mean Severity'),
+      zaxis = list(title = 'SD Severity')
+    )
+  )
+
+
+
+# Step 1: Count the number of claims for each exposure_id and condition_category
+claim_counts2 <- claims %>%
+  group_by(exposure_id, condition_category) %>%
+  summarise(claim_count = n()) %>%
+  ungroup()
+
+frequency_data_clus <- claim_counts2 %>%
+  left_join(earned, by = "exposure_id") %>%
+  select(exposure_id, condition_category, claim_count)
+
+# Calculate mean and standard deviation of claim_count for each condition_category
+frequency_summary <- frequency_data_clus %>%
+  group_by(condition_category) %>%
+  summarise(
+    mean_frequency = mean(claim_count, na.rm = TRUE),
+    sd_frequency = sd(claim_count, na.rm = TRUE)
+  )
+
+# Calculate mean and standard deviation of claim_paid for severity_data
+severity_summary <- severity_data %>%
+  group_by(condition_category) %>%
+  summarise(
+    mean_severity = mean(claim_paid, na.rm = TRUE),
+    sd_severity = sd(claim_paid, na.rm = TRUE)
+  )
+
+# Merging both summaries into a single data frame
+condition_summary <- merge(frequency_summary, severity_summary, by = "condition_category")
+
+# Step 1: Prepare the data with mean_frequency, mean_severity, and sd_severity
+condition_data_scaled_3d <- scale(condition_summary[, c("mean_frequency", "mean_severity", "sd_severity")])
+
+# Step 2: Perform K-means clustering with 3 centers (as determined earlier)
+set.seed(123)
+kmeans_3d <- kmeans(condition_data_scaled_3d, centers = 5, nstart = 25)
+
+# Step 3: Calculate silhouette score for this clustering
+silhouette_3d <- silhouette(kmeans_3d$cluster, dist(condition_data_scaled_3d))
+
+# Step 4: Visualize the silhouette plot for this clustering
+fviz_silhouette(silhouette_3d) + ggtitle("Silhouette Plot - Clustering with Mean Frequency, Mean Severity, and SD Severity")
+
+# Step 5: Calculate the average silhouette width
+avg_silhouette_3d <- mean(silhouette_3d[, 3])
+cat("Average Silhouette Width (3D Clustering - Mean Frequency, Mean Severity, and SD Severity):", avg_silhouette_3d, "\n")
+
+# Step 6: Add the cluster results to the original data
+condition_summary$cluster <- as.factor(kmeans_3d$cluster)
+
+# Step 7: Create the 3D scatter plot using the standardized values
+plot_ly(
+  data = condition_summary,
+  x = ~mean_frequency,  # This is now the standardized mean_frequency
+  y = ~mean_severity,   # Standardized mean_severity
+  z = ~sd_severity,     # Standardized sd_severity
+  color = ~cluster,     # Cluster will be represented by color
+  size = ~mean_severity,  # Size represents the mean_severity
+  text = ~condition_category,  # Condition category as hover text
+  type = 'scatter3d',   # 3D scatter plot
+  mode = 'markers',
+  marker = list(sizemode = 'diameter')  # Adjust size by diameter
+) %>%
+  layout(
+    title = "3D Scatter Plot of Condition Categories",
+    scene = list(
+      xaxis = list(title = 'Mean Frequency'),
+      yaxis = list(title = 'Mean Severity'),
+      zaxis = list(title = 'SD Severity')
+    )
+  )
+
+
+
+
+
+# Step 1: Define a range of k values
+k_values <- 1:10
+
+# Step 2: Initialize a vector to hold the total WSS for each k
+wss_values <- numeric(length(k_values))
+
+# Step 3: Calculate WSS for each k
+for (k in k_values) {
+  kmeans_model <- kmeans(condition_data_scaled_3d, centers = k, nstart = 25)
+  wss_values[k] <- kmeans_model$tot.withinss
+}
+
+# Create the elbow plot using ggplot
+elbow_plot <- ggplot(data = data.frame(k = k_values, wss = wss_values), aes(x = k, y = wss)) +
+  geom_point(color = "skyblue", size = 3) + 
+  geom_line(color = "darkblue") + 
+  labs(x = "Number of Clusters (k)", y = "Total Within-Cluster Sum of Squares (WSS)") +
+  scale_x_continuous(breaks = 1:10) +  # Specify breaks for x-axis from 1 to 10
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5), 
+        legend.position = "none")  # Set angle to 0 for horizontal labels and remove legend
+
+# Save the elbow plot to a file
+ggsave(filename = "elbow_plot.png", height = 11, width = 12, units = 'cm', dpi = 1080, plot = elbow_plot)
+
+
+# Step 1: Combine clusters 1, 2, and 3 into a single cluster (renamed as "1")
+condition_summary$merged_cluster <- ifelse(condition_summary$cluster %in% c(1, 2, 3), 1, condition_summary$cluster)
+
+# Step 2: Convert the new merged cluster column to a factor
+condition_summary$merged_cluster <- as.factor(condition_summary$merged_cluster)
+
+# Step 3: Create a new 3D scatter plot with the merged clusters
+plot_ly(
+  data = condition_summary,
+  x = ~mean_frequency,  # Standardized mean_frequency
+  y = ~mean_severity,   # Standardized mean_severity
+  z = ~sd_severity,     # Standardized sd_severity
+  color = ~merged_cluster,  # Use the new merged cluster
+  size = ~mean_severity,    # Size represents the mean_severity
+  text = ~condition_category,  # Hover text with condition_category
+  type = 'scatter3d',         # 3D scatter plot
+  mode = 'markers',
+  marker = list(sizemode = 'diameter')  # Adjust size by diameter
+) %>%
+  layout(
+    title = "3D Scatter Plot of Merged Clusters (1, 2, 3 grouped together)",
+    scene = list(
+      xaxis = list(title = 'Mean Frequency'),
+      yaxis = list(title = 'Mean Severity'),
+      zaxis = list(title = 'SD Severity')
+    )
+  )
+
+# Load necessary libraries
+library(cluster)  # For silhouette calculation
+library(dplyr)    # For data manipulation
+library(entropy)  # For entropy calculation
+
+# Step 1: Calculate the silhouette score
+# Ensure the merged cluster is in the right format
+condition_summary$merged_cluster <- as.numeric(condition_summary$merged_cluster)
+
+# Calculate silhouette score
+silhouette_values <- silhouette(condition_summary$merged_cluster, dist(condition_data_scaled_3d))
+avg_silhouette_score <- mean(silhouette_values[, 3])  # Average silhouette width
+
+cat("Average Silhouette Score (after merging clusters):", avg_silhouette_score, "\n")
+
+# Step 2: Calculate entropy
+# Create a contingency table
+contingency_table <- table(condition_summary$merged_cluster, condition_summary$condition_category)
+
+# Calculate probabilities for each cluster
+probabilities <- prop.table(contingency_table, margin = 1)
+
+# Calculate entropy for each cluster
+entropy_values <- apply(probabilities, 1, function(p) {
+  -sum(p * log2(p + (p == 0)))  # Avoid log(0) by adding a small value
+})
+
+# Calculate the overall entropy
+overall_entropy <- sum(entropy_values * rowSums(contingency_table) / sum(contingency_table))
+
+cat("Overall Entropy (after merging clusters):", overall_entropy, "\n")
+
+
+
+#----Assign clusters----
+
+claim_counts_with_cluster <- claim_counts2 %>%
+  left_join(condition_summary %>% 
+              mutate(merged_cluster = ifelse(cluster %in% c(1, 2, 3), 1, cluster)) %>%
+              select(condition_category, merged_cluster), 
+            by = "condition_category") %>%
+  group_by(exposure_id, merged_cluster) %>%
+  summarise(claim_count = sum(claim_count, na.rm = TRUE)) %>%
+  ungroup()
+
+# Step 2: Pivot the data to create columns for each merged cluster
+cluster_frequencies <- claim_counts_with_cluster %>%
+  spread(key = merged_cluster, value = claim_count, fill = 0)
+
+# Rename the cluster columns to cat1 (for merged 1, 2, 3), cat2, and cat3 (for original clusters 4 and 5)
+names(cluster_frequencies)[2:4] <- c("cat1", "cat2", "cat3")
+
+# Step 3: Join the cluster frequencies back to the 'frequency_data' dataset
+frequency_data <- frequency_data %>%
+  left_join(cluster_frequencies, by = "exposure_id")
+
+# Step 4: Handle cases where claim_count = 0 by setting cat1, cat2, and cat3 to 0
+frequency_data <- frequency_data %>%
+  mutate(
+    cat1 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat1),
+    cat2 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat2),
+    cat3 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat3)
+  )
+
+frequency_data <- frequency_data %>%
+  mutate(
+    claim_rate_cat1 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat1 / earned_units),
+    claim_rate_cat2 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat2 / earned_units),
+    claim_rate_cat3 = ifelse(is.na(claim_count) | claim_count == 0, 0, cat3 / earned_units)
+  )
+
+
+
+#----Feature engineering on pre-provided features----
+
+frequency_data$nb_policy_first_inception_date <- as.Date(frequency_data$nb_policy_first_inception_date, format="%Y-%m-%d")
+
+# Extract year and month from the inception date
+frequency_data <- frequency_data %>%
+  mutate(inception_year = as.numeric(format(nb_policy_first_inception_date, "%Y")),
+         inception_month = as.numeric(format(nb_policy_first_inception_date, "%m")))
+
+# Find the maximum inception date in the dataset
+max_inception_date <- max(frequency_data$nb_policy_first_inception_date, na.rm = TRUE)
+
+# Calculate the number of months between the inception date and the maximum date in the variable
+frequency_data <- frequency_data %>%
+  mutate(policy_age_months = as.numeric(difftime(max_inception_date, nb_policy_first_inception_date, units = "days")) / 30)
+
+# Create a season feature based on the month of inception
+frequency_data <- frequency_data %>%
+  mutate(season_inception = case_when(
+    inception_month %in% c(12, 1, 2) ~ "Summer",
+    inception_month %in% c(3, 4, 5) ~ "Autumn",
+    inception_month %in% c(6, 7, 8) ~ "Winter",
+    inception_month %in% c(9, 10, 11) ~ "Spring"
+  ))
+
+# Create policy age groups relative to the maximum inception date
+frequency_data <- frequency_data %>%
+  mutate(policy_age_group = case_when(
+    policy_age_months <= 6 ~ "Very New",
+    policy_age_months <= 12 ~ "New",
+    policy_age_months <= 36 ~ "Mid",
+    TRUE ~ "Established"
+  ))
+
+# Create an indicator for recently incepted policies (e.g., within the last 6 months relative to the maximum inception date)
+frequency_data <- frequency_data %>%
+  mutate(is_recent_policy = ifelse(policy_age_months <= 6, 1, 0))
+
+# Calculate days since the start of the inception year
+frequency_data <- frequency_data %>%
+  mutate(days_since_start_of_year = as.numeric(difftime(nb_policy_first_inception_date, as.Date(paste0(inception_year, "-01-01")), units = "days")))
+
+# Calculate the number of months since the start of the coverage
+frequency_data <- frequency_data %>%
+  mutate(months_since_UW = as.numeric(difftime(Sys.Date(), UW_Date, units = "days")) / 30)
+
+# Convert to Date if needed
+frequency_data$lead_date_day <- as.Date(frequency_data$lead_date_day, format="%Y-%m-%d")
+frequency_data$nb_policy_first_inception_date <- as.Date(frequency_data$nb_policy_first_inception_date, format="%Y-%m-%d")
+
+# Calculate the time difference between lead_date_day and nb_policy_first_inception_date in days
+frequency_data <- frequency_data %>%
+  mutate(time_to_inception_days = as.numeric(difftime(nb_policy_first_inception_date, lead_date_day, units = "days")))
+
+### Note tenure is captured by earned_units
+
+cor(frequency_data$tenure, frequency_data$earned_units)
+
+frequency_data2 <- frequency_data %>%
+  select(exp_future_life, exposure_id, inception_year, policy_age_months, season_inception, earned_units,
+         policy_age_group, 
+         claim_count, cat1, cat2, cat3, claim_rate_cat1, claim_rate_cat2, claim_rate_cat3,
+         nb_contribution_excess, nb_contribution, nb_excess,
+         pet_age_months, nb_average_breed_size,
+         is_multi_pet_plan, pet_de_sexed, pet_gender,
+         nb_address_type_adj, nb_breed_type, owner_age_years,
+         Total_number_bus, Agriculture_forestry_fishing_per,
+         Health_care_social_assistance_per, Completed_year_12_perc,
+         Average_household_size, Participation_rate,
+         Median_employee_income_SA3, Dog.Breed.Group,
+         Sensitivity.Level,happy_in_apartment, dog_safety,
+         Tolerates.Cold.Weather, Tolerates.Hot.Weather,
+         Kid.Friendly, Friendly.Toward.Strangers,
+         Drooling.Potential, Easy.To.Groom, General.Health,
+         Potential.For.Weight.Gain, Intelligence,
+         Potential.For.Mouthiness, Prey.Drive, expected_aggression,
+         Tendency.To.Bark.Or.Howl, Wanderlust.Potential,
+         Energy.Level, Intensity)
+
+# Assuming frequency_data is your original data frame
+frequency_data <- frequency_data %>%
+  select(exp_future_life, inception_year, policy_age_months, season_inception, earned_units,
+         policy_age_group, 
+         claim_count, cat1, cat2, cat3, claim_rate_cat1, claim_rate_cat2, claim_rate_cat3,
+         nb_contribution_excess, nb_contribution, nb_excess,
+         pet_age_months, nb_average_breed_size,
+         is_multi_pet_plan, pet_de_sexed, pet_gender,
+         nb_address_type_adj, nb_breed_type, owner_age_years,
+         Total_number_bus, Agriculture_forestry_fishing_per,
+         Health_care_social_assistance_per, Completed_year_12_perc,
+         Average_household_size, Participation_rate,
+         Median_employee_income_SA3, Dog.Breed.Group,
+         Sensitivity.Level,dog_safety, happy_in_apartment,
+         Tolerates.Cold.Weather, Tolerates.Hot.Weather,
+         Kid.Friendly, Friendly.Toward.Strangers,
+         Drooling.Potential, Easy.To.Groom, General.Health,
+         Potential.For.Weight.Gain, Intelligence,
+         Potential.For.Mouthiness, Prey.Drive, expected_aggression,
+         Tendency.To.Bark.Or.Howl, Wanderlust.Potential,
+         Energy.Level, Intensity)
+
+# Step 1: Select only numeric columns for the correlation matrix
+numeric_data <- frequency_data[sapply(frequency_data, is.numeric)]
+
+# Step 2: Calculate the correlation matrix
+cor_matrix <- cor(numeric_data, use = "complete.obs")  # 'complete.obs' excludes NA values
+
+# Step 3: Find correlations greater than 0.5 (ignoring self-correlations)
+high_corr <- which(abs(cor_matrix) > 0.5 & abs(cor_matrix) < 1, arr.ind = TRUE)
+
+# Display the pairs of variables with correlation greater than 0.5
+high_corr_pairs <- data.frame(
+  Variable1 = rownames(cor_matrix)[high_corr[, 1]],
+  Variable2 = colnames(cor_matrix)[high_corr[, 2]],
+  Correlation = cor_matrix[high_corr]
+)
+
+# Print the pairs of highly correlated variables
+print(high_corr_pairs)
+
+# Remove the 'policy_age_months' and 'inception_year' columns from frequency_data
+frequency_data <- frequency_data[, !(names(frequency_data) %in% c("policy_age_months", "inception_year"))]
+
+# Remove the 'Dog.Breed.Group', 'season_inception', and 'risk_group' columns from frequency_data
+frequency_data <- frequency_data[, !(names(frequency_data) %in% c("Dog.Breed.Group", "season_inception"))]
+frequency_data2 <- frequency_data2[, !(names(frequency_data2) %in% c("Dog.Breed.Group", "season_inception"))]
+
+#----Creating data splits----
+
+# Load required libraries
+library(dplyr)
+
+# List of exceptions (variables not to convert)
+exceptions <- c("Avg..Life.Span..years")
+
+# Identify the columns with dots (.) in their names that are not exceptions
+cols_to_change <- colnames(frequency_data) %>%
+  grep("\\.", ., value = TRUE) %>%
+  setdiff(exceptions)
+
+# Add "Intensity" and "Intelligence" to the list of variables to be converted
+cols_to_change <- union(cols_to_change, c("Intensity", "Intelligence"))
+
+# Convert these columns to ordinal variables with 5 levels
+frequency_data <- frequency_data %>%
+  mutate(across(all_of(cols_to_change), ~ cut(., breaks = 5, labels = 1:5, ordered_result = TRUE)))
+
+# Display the structure of the modified dataset
+str(frequency_data)
+
+
+# Convert these columns to ordinal variables with 5 levels
+severity_data <- severity_data %>%
+  mutate(across(all_of(cols_to_change), ~ cut(., breaks = 5, labels = 1:5, ordered_result = TRUE)))
+
+# Display the structure of the modified dataset
+str(severity_data)
+
+# Convert these columns to ordinal variables with 5 levels
+frequency_data2 <- frequency_data2 %>%
+  mutate(across(all_of(cols_to_change), ~ cut(., breaks = 5, labels = 1:5, ordered_result = TRUE)))
+
+# Display the structure of the modified dataset
+str(frequency_data2)
+
+# Remove rows where Health_care_social_assistance_per or Median_employee_income_SA3 is NA - avoids issues later on when modelling
+frequency_data <- frequency_data %>%
+  filter(!is.na(Health_care_social_assistance_per) & !is.na(Median_employee_income_SA3) & !is.na(cat1) & !is.na(Drooling.Potential))
+
+frequency_data2 <- frequency_data2 %>%
+  filter(!is.na(Health_care_social_assistance_per) & !is.na(Median_employee_income_SA3) & !is.na(cat1) & !is.na(Drooling.Potential))
+
+# Convert character columns to factors
+frequency_data$policy_age_group <- as.factor(frequency_data$policy_age_group)
+frequency_data2$policy_age_group <- as.factor(frequency_data2$policy_age_group)
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Create a single train-test split for the frequency data (80% train, 20% test)
+train_index <- sample(seq_len(nrow(frequency_data)), size = 0.8 * nrow(frequency_data))
+train_data <- frequency_data[train_index, ]
+test_data <- frequency_data[-train_index, ]
+
+# Extract year and month from the inception date
+severity_data <- severity_data %>%
+  mutate(inception_month = as.numeric(format(nb_policy_first_inception_date, "%m")))
+
+# Calculate the number of months between the inception date and the maximum date in the variable
+severity_data <- severity_data %>%
+  mutate(policy_age_months = as.numeric(difftime(max_inception_date, nb_policy_first_inception_date, units = "days")) / 30)
+
+# Create policy age groups relative to the maximum inception date
+severity_data <- severity_data %>%
+  mutate(policy_age_group = case_when(
+    policy_age_months <= 6 ~ "Very New",
+    policy_age_months <= 12 ~ "New",
+    policy_age_months <= 36 ~ "Mid",
+    TRUE ~ "Established"
+  ))
+
+# Extract year and month of coverage
+severity_data <- severity_data %>%
+  mutate(UW_month = as.numeric(format(UW_Date, "%m")))
+
+# Join severity_data with the merged cluster assignment from condition_summary by condition_category
+severity_data <- severity_data %>%
+  left_join(condition_summary %>% 
+              mutate(merged_cluster = ifelse(cluster %in% c(1, 2, 3), 1, cluster)) %>%
+              select(condition_category, merged_cluster), 
+            by = "condition_category")
+
+severity_data <- severity_data %>%
+  select(exp_future_life, earned_units,happy_in_apartment, dog_safety,
+         policy_age_group, merged_cluster, 
+         claim_paid, pet_age_months, nb_average_breed_size,
+    nb_contribution_excess, nb_contribution, nb_excess,
+    is_multi_pet_plan, pet_de_sexed, pet_gender,
+    nb_address_type_adj, nb_breed_type, owner_age_years,
+    Total_number_bus, Agriculture_forestry_fishing_per,
+    Health_care_social_assistance_per, Completed_year_12_perc,
+    Average_household_size, Participation_rate,
+    Median_employee_income_SA3,
+    Sensitivity.Level,expected_aggression,
+    Tolerates.Cold.Weather, Tolerates.Hot.Weather,
+    Kid.Friendly, Friendly.Toward.Strangers,
+    Drooling.Potential, Easy.To.Groom, General.Health,
+    Potential.For.Weight.Gain, Intelligence,
+    Potential.For.Mouthiness, Prey.Drive,
+    Tendency.To.Bark.Or.Howl, Wanderlust.Potential,
+    Energy.Level, Intensity
+  )
+
+# Step 1: Remove rows where Energy.Level or Health_care_social_assistance_per are NA
+severity_data <- severity_data %>%
+  filter(!is.na(Energy.Level) & !is.na(Health_care_social_assistance_per))
+
+# Convert 'policy_age_group' and 'UW_season' to factors in severity_data
+severity_data$policy_age_group <- as.factor(severity_data$policy_age_group)
+
+# Subset the severity data based on the merged clusters
+severity_data_cat1 <- severity_data %>% filter(merged_cluster == 1)
+severity_data_cat2 <- severity_data %>% filter(merged_cluster == 4)
+severity_data_cat3 <- severity_data %>% filter(merged_cluster == 5)
+
+# Apply the same train-test split to the severity data for Cat1
+train_data_cat1 <- severity_data_cat1[rownames(severity_data_cat1) %in% train_index, ]
+test_data_cat1 <- severity_data_cat1[!rownames(severity_data_cat1) %in% train_index, ]
+
+# Apply the same train-test split to the severity data for Cat2
+train_data_cat2 <- severity_data_cat2[rownames(severity_data_cat2) %in% train_index, ]
+test_data_cat2 <- severity_data_cat2[!rownames(severity_data_cat2) %in% train_index, ]
+
+# Apply the same train-test split to the severity data for Cat3
+train_data_cat3 <- severity_data_cat3[rownames(severity_data_cat3) %in% train_index, ]
+test_data_cat3 <- severity_data_cat3[!rownames(severity_data_cat3) %in% train_index, ]
+
+# Remove the 'merged_cluster' and 'earned_units' columns from the severity training and test datasets
+
+# Cat1
+train_data_cat1 <- train_data_cat1 %>% select(-merged_cluster, -earned_units)
+test_data_cat1 <- test_data_cat1 %>% select(-merged_cluster, -earned_units)
+
+# Cat2
+train_data_cat2 <- train_data_cat2 %>% select(-merged_cluster, -earned_units)
+test_data_cat2 <- test_data_cat2 %>% select(-merged_cluster, -earned_units)
+
+# Cat3
+train_data_cat3 <- train_data_cat3 %>% select(-merged_cluster, -earned_units)
+test_data_cat3 <- test_data_cat3 %>% select(-merged_cluster, -earned_units)
+
+# Check if all exposures in test_data are covered by test_data_cat1, test_data_cat2, and test_data_cat3
+all_exposures_test_data <- test_data$exposure_id
+cat1_exposures <- test_data_cat1$exposure_id
+cat2_exposures <- test_data_cat2$exposure_id
+cat3_exposures <- test_data_cat3$exposure_id
+
+# Check if the combined exposures of cat1, cat2, and cat3 are the same as test_data
+setequal(all_exposures_test_data, union(union(cat1_exposures, cat2_exposures), cat3_exposures))
+
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Create a single train-test split for the frequency data (80% train, 20% test)
+train_index <- sample(seq_len(nrow(frequency_data)), size = 0.8 * nrow(frequency_data))
+
+test_data_prem <- frequency_data2[-train_index, ]
+
+test_data_prem$exp_future_life
+
